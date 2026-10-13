@@ -654,6 +654,16 @@ _config_parses_ok() {
   return 0
 }
 
+_FUGU_AWK_TABLES='
+function tbl_name(s,   n, t) {
+  t = s; gsub(/"([^"\\]|\\.)*"|\047[^\047]*\047/, "\"\"", t); sub(/#.*$/, "", t)
+  if (t !~ /^[ \t]*\[/ || t ~ /[=,]/) return ""
+  n = s; sub(/^[ \t]*\[+[ \t]*/, "", n); sub(/[ \t]*\].*$/, "", n)
+  return n
+}
+function foreign_hdr(s,   n) { n = tbl_name(s); return n != "" && n != id && index(n, id ".") != 1 }
+'
+
 inject_managed_block() {
   local file="$1" id="$2" snippet="$3"
   local open="# >>> fugu:${id} >>>" close="# <<< fugu:${id} <<<"
@@ -679,11 +689,12 @@ inject_managed_block() {
   mkdir -p "$(dirname "$file")"
   local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/fugu-block.XXXXXX")"
   if [ -f "$file" ] && grep -qxF "$open" "$file"; then
-    FUGU_SNIP="$snippet" awk -v mo="$open" -v mc="$close" '
-      $0 == mo  { print mo; print ENVIRON["FUGU_SNIP"]; print mc; skip = 1; next }
-      $0 == mc  { if (skip) { skip = 0; next } }
-      skip { next }
+    FUGU_SNIP="$snippet" awk -v mo="$open" -v mc="$close" -v id="$id" "$_FUGU_AWK_TABLES"'
+      $0 == mo  { print mo; print ENVIRON["FUGU_SNIP"]; skip = 1; foreign = 0; tail = ""; next }
+      $0 == mc  { if (skip) { skip = 0; print mc; if (tail != "") printf "\n%s", tail; next } }
+      skip      { if (!foreign && foreign_hdr($0)) foreign = 1; if (foreign) tail = tail $0 "\n"; next }
       { print }
+      END       { if (skip) { print mc; if (tail != "") printf "\n%s", tail } }
     ' "$file" > "$tmp"
   else
     [ -f "$file" ] && cat "$file" > "$tmp"
@@ -711,14 +722,19 @@ remove_managed_block() {
   grep -qxF "$open" "$file"   || { log_info "No fugu:${id} block in ${file}."; return 0; }
   if [ "${DRY_RUN:-0}" = "1" ]; then log_info "[dry-run] would remove fugu:${id} from ${file}"; return 0; fi
   tmp="$(mktemp "${TMPDIR:-/tmp}/fugu-rm.XXXXXX")"
-  awk -v mo="$open" -v mc="$close" '
+  awk -v mo="$open" -v mc="$close" -v id="$id" "$_FUGU_AWK_TABLES"'
     {
-      if (inblk) { if ($0 == mc) inblk = 0; next }
-      if ($0 == mo) { if (held && heldline != "") print heldline; held = 0; inblk = 1; next }
+      if (inblk) {
+        if ($0 == mc) { inblk = 0; if (tail != "") { if (sep) print ""; printf "%s", tail }; next }
+        if (!foreign && foreign_hdr($0)) foreign = 1
+        if (foreign) tail = tail $0 "\n"
+        next
+      }
+      if ($0 == mo) { sep = (held && heldline == ""); if (held && heldline != "") print heldline; held = 0; inblk = 1; foreign = 0; tail = ""; next }
       if (held) print heldline
       heldline = $0; held = 1
     }
-    END { if (held) print heldline }
+    END { if (held) print heldline; if (inblk && tail != "") { if (sep) print ""; printf "%s", tail } }
   ' "$file" > "$tmp"
   cat "$tmp" > "$file"; rm -f "$tmp"
   log_ok "Removed managed block fugu:${id} from ${file}."
